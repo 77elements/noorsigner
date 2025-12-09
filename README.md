@@ -785,8 +785,31 @@ The Unix socket is created with `0600` permissions (owner read/write only), prev
 
 ### Windows
 - Named Pipe: `\\.\pipe\noorsigner`
-- **Note**: Windows implementation is basic, lacks process forking
+- Storage: `%APPDATA%\NoorSigner\`
+- Daemon runs in background with `DETACHED_PROCESS` flag
 - Autostart: Not yet implemented
+
+#### Windows Named Pipe Example
+
+```powershell
+# PowerShell example to connect to NoorSigner
+$pipe = New-Object System.IO.Pipes.NamedPipeClientStream(".", "noorsigner", [System.IO.Pipes.PipeDirection]::InOut)
+$pipe.Connect(5000)
+
+$writer = New-Object System.IO.StreamWriter($pipe)
+$reader = New-Object System.IO.StreamReader($pipe)
+
+# Send request
+$request = '{"id":"req-1","method":"get_npub"}'
+$writer.WriteLine($request)
+$writer.Flush()
+
+# Read response
+$response = $reader.ReadLine()
+Write-Host $response
+
+$pipe.Close()
+```
 
 ---
 
