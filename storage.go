@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -28,20 +29,38 @@ type EncryptedKey struct {
 	EncryptedNsec  []byte `json:"encrypted_nsec"`
 }
 
-// getStorageDir returns ~/.noorsigner/ directory
+// getStorageDir returns the storage directory for NoorSigner data
+// Windows: %APPDATA%\NoorSigner
+// Unix: ~/.noorsigner
 func getStorageDir() (string, error) {
-	homeDir, err := os.UserHomeDir()
-	if err != nil {
-		return "", fmt.Errorf("cannot get home directory: %v", err)
+	var storageDir string
+
+	if runtime.GOOS == "windows" {
+		// Windows: use %APPDATA%\NoorSigner
+		appData := os.Getenv("APPDATA")
+		if appData == "" {
+			// Fallback if APPDATA is not set
+			home, err := os.UserHomeDir()
+			if err != nil {
+				return "", fmt.Errorf("cannot get home directory: %v", err)
+			}
+			appData = filepath.Join(home, "AppData", "Roaming")
+		}
+		storageDir = filepath.Join(appData, "NoorSigner")
+	} else {
+		// Unix: use ~/.noorsigner
+		homeDir, err := os.UserHomeDir()
+		if err != nil {
+			return "", fmt.Errorf("cannot get home directory: %v", err)
+		}
+		storageDir = filepath.Join(homeDir, ".noorsigner")
 	}
 
-	storageDir := filepath.Join(homeDir, ".noorsigner")
-	
 	// Create directory if it doesn't exist
 	if err := os.MkdirAll(storageDir, 0700); err != nil {
 		return "", fmt.Errorf("cannot create storage directory: %v", err)
 	}
-	
+
 	return storageDir, nil
 }
 

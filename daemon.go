@@ -7,29 +7,30 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
-	"path/filepath"
+	"sync"
 	"syscall"
 
 	"github.com/btcsuite/btcd/btcec/v2"
 )
 
-func getSocketPath() (string, error) {
-	storageDir, err := getStorageDir()
-	if err != nil {
-		return "", err
-	}
-	return filepath.Join(storageDir, "noorsigner.sock"), nil
-}
+// NOTE: getSocketPath(), createListener(), cleanupListener(), dialConnection()
+// are defined in daemon_unix.go (Unix) and daemon_windows.go (Windows)
 
 // SignRequest represents a signing request via IPC
 type SignRequest struct {
-	ID             string `json:"id"`
-	Method         string `json:"method"`
-	EventJSON      string `json:"event_json,omitempty"`
-	Plaintext      string `json:"plaintext,omitempty"`
+	ID              string `json:"id"`
+	Method          string `json:"method"`
+	EventJSON       string `json:"event_json,omitempty"`
+	Plaintext       string `json:"plaintext,omitempty"`
 	RecipientPubkey string `json:"recipient_pubkey,omitempty"`
-	Payload        string `json:"payload,omitempty"`
-	SenderPubkey   string `json:"sender_pubkey,omitempty"`
+	Payload         string `json:"payload,omitempty"`
+	SenderPubkey    string `json:"sender_pubkey,omitempty"`
+	// Multi-account fields
+	Pubkey    string `json:"pubkey,omitempty"`
+	Npub      string `json:"npub,omitempty"`
+	Nsec      string `json:"nsec,omitempty"`
+	Password  string `json:"password,omitempty"`
+	SetActive bool   `json:"set_active,omitempty"`
 }
 
 // SignResponse represents a signing response
@@ -39,46 +40,93 @@ type SignResponse struct {
 	Error     string `json:"error,omitempty"`
 }
 
+// AccountResponse represents an account in list response
+type AccountResponse struct {
+	Pubkey    string `json:"pubkey"`
+	Npub      string `json:"npub"`
+	CreatedAt int64  `json:"created_at"`
+}
+
+// ListAccountsResponse represents list_accounts response
+type ListAccountsResponse struct {
+	ID           string            `json:"id"`
+	Accounts     []AccountResponse `json:"accounts"`
+	ActivePubkey string            `json:"active_pubkey"`
+	Error        string            `json:"error,omitempty"`
+}
+
+// AccountActionResponse represents add/switch/remove account response
+type AccountActionResponse struct {
+	ID      string `json:"id"`
+	Success bool   `json:"success"`
+	Pubkey  string `json:"pubkey,omitempty"`
+	Npub    string `json:"npub,omitempty"`
+	Error   string `json:"error,omitempty"`
+}
+
+// ActiveAccountResponse represents get_active_account response
+type ActiveAccountResponse struct {
+	ID         string `json:"id"`
+	Pubkey     string `json:"pubkey"`
+	Npub       string `json:"npub"`
+	IsUnlocked bool   `json:"is_unlocked"`
+	Error      string `json:"error,omitempty"`
+}
+
 // Daemon holds the daemon state
 type Daemon struct {
 	privateKey *btcec.PrivateKey
 	npub       string
+	pubkey     string
 	listener   net.Listener
 	shutdown   chan bool
+	mu         sync.RWMutex // Protects privateKey, npub, pubkey during account switch
 }
 
 // startDaemon starts the key signing daemon
 func startDaemon() {
 	fmt.Println("🔐 Starting NoorSigner Daemon")
 
-	// Load and decrypt key
-	encryptedKey, err := loadEncryptedKey()
+	// Get active account
+	activeNpub, err := loadActiveAccount()
 	if err != nil {
-		// No encrypted key found - run init first
-		fmt.Println("⚠️  No encrypted key found - initializing...")
-		fmt.Println()
-		success := initKeySigner()
-		if !success {
+		// No active account - check for accounts or run init
+		accounts, listErr := listAccounts()
+		if listErr != nil || len(accounts) == 0 {
+			fmt.Println("⚠️  No accounts found - initializing...")
 			fmt.Println()
-			fmt.Println("❌ Initialization failed. Please try again.")
-			return
-		}
-		fmt.Println()
-		fmt.Println("✅ Initialization complete! Starting daemon...")
-		fmt.Println()
+			addAccount()
+			fmt.Println()
+			fmt.Println("✅ Initialization complete! Starting daemon...")
+			fmt.Println()
 
-		// Load the newly created key
-		encryptedKey, err = loadEncryptedKey()
-		if err != nil {
-			fmt.Printf("Error loading newly created key: %v\n", err)
-			return
+			// Reload active account
+			activeNpub, err = loadActiveAccount()
+			if err != nil {
+				fmt.Printf("Error loading active account: %v\n", err)
+				return
+			}
+		} else {
+			// Accounts exist but no active account - set first one as active
+			activeNpub = accounts[0].Npub
+			if err := saveActiveAccount(activeNpub); err != nil {
+				fmt.Printf("Error setting active account: %v\n", err)
+				return
+			}
 		}
+	}
+
+	// Load encrypted key for active account
+	encryptedKey, err := loadAccountEncryptedKey(activeNpub)
+	if err != nil {
+		fmt.Printf("Error loading account key: %v\n", err)
+		return
 	}
 
 	// Check for existing trust session first
 	var nsec string
 	fmt.Println("🔍 Checking for existing Trust Mode session...")
-	trustSession, err := loadTrustSession()
+	trustSession, err := loadAccountTrustSession(activeNpub)
 	if err != nil {
 		fmt.Printf("   No trust session found: %v\n", err)
 	} else {
@@ -98,7 +146,7 @@ func startDaemon() {
 		if err != nil {
 			fmt.Printf("Error decrypting trust session: %v\n", err)
 			// Clear invalid trust session
-			clearTrustSession()
+			clearAccountTrustSession(activeNpub)
 			return
 		}
 	} else {
@@ -128,7 +176,7 @@ func startDaemon() {
 			return
 		}
 
-		if err := saveTrustSession(session); err != nil {
+		if err := saveAccountTrustSession(activeNpub, session); err != nil {
 			fmt.Printf("Error saving trust session: %v\n", err)
 			return
 		}
@@ -147,24 +195,29 @@ func startDaemon() {
 	for i := range nsec {
 		nsec = nsec[:i] + "x" + nsec[i+1:]
 	}
-	
-	// Generate npub for display
-	npub := privateKeyToNpub(privateKey)
-	
+
+	// Get pubkey
+	pubkey, err := npubToPubkey(activeNpub)
+	if err != nil {
+		fmt.Printf("Error getting pubkey: %v\n", err)
+		return
+	}
+
 	// Create daemon instance
 	daemon := &Daemon{
 		privateKey: privateKey,
-		npub:       npub,
+		npub:       activeNpub,
+		pubkey:     pubkey,
 		shutdown:   make(chan bool, 1),
 	}
-	
+
 	socketPath, err := getSocketPath()
 	if err != nil {
 		fmt.Printf("Error getting socket path: %v\n", err)
 		return
 	}
 
-	fmt.Printf("✅ Daemon unlocked for: %s\n", npub)
+	fmt.Printf("✅ Daemon unlocked for: %s\n", activeNpub)
 	fmt.Printf("📡 Listening on: %s\n", socketPath)
 	fmt.Println()
 
@@ -173,14 +226,19 @@ func startDaemon() {
 
 	if shouldFork {
 		// Fork to background by re-executing ourselves
-		cmd := exec.Command(os.Args[0], os.Args[1:]...)
+		// Use absolute path to avoid Windows security restrictions
+		exePath, err := os.Executable()
+		if err != nil {
+			fmt.Printf("Failed to get executable path: %v\n", err)
+			return
+		}
+		cmd := exec.Command(exePath, os.Args[1:]...)
 		cmd.Env = append(os.Environ(), "NOORSIGNER_FORKED=1")
 
 		// Detach from terminal (Unix only)
 		cmd.SysProcAttr = getSysProcAttr()
 
-		err := cmd.Start()
-		if err != nil {
+		if err := cmd.Start(); err != nil {
 			fmt.Printf("Failed to fork daemon: %v\n", err)
 			return
 		}
@@ -200,41 +258,28 @@ func startDaemon() {
 	}
 }
 
-// serve starts the Unix Domain Socket server
+// serve starts the IPC server (Unix socket or Windows Named Pipe)
 func (d *Daemon) serve() error {
-	socketPath, err := getSocketPath()
+	// Create platform-specific listener
+	listener, err := createListener()
 	if err != nil {
-		return fmt.Errorf("failed to get socket path: %v", err)
-	}
-
-	// Remove existing socket if it exists
-	os.Remove(socketPath)
-
-	// Create Unix Domain Socket
-	listener, err := net.Listen("unix", socketPath)
-	if err != nil {
-		return fmt.Errorf("failed to create socket: %v", err)
+		return fmt.Errorf("failed to create listener: %v", err)
 	}
 	d.listener = listener
-	
-	// Set socket permissions (only user can access)
-	if err := os.Chmod(socketPath, 0600); err != nil {
-		return fmt.Errorf("failed to set socket permissions: %v", err)
-	}
-	
+
 	// Handle shutdown signals
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
-	
+
 	go func() {
 		<-sigChan
 		fmt.Println("\n🔒 Shutting down daemon...")
 		d.shutdownDaemon()
 		os.Exit(0)
 	}()
-	
+
 	fmt.Println("Daemon ready for signing requests")
-	
+
 	// Accept connections
 	for {
 		select {
@@ -252,7 +297,7 @@ func (d *Daemon) serve() error {
 					continue
 				}
 			}
-			
+
 			// Handle connection in goroutine
 			go d.handleConnection(conn)
 		}
@@ -262,10 +307,10 @@ func (d *Daemon) serve() error {
 // handleConnection handles a single client connection
 func (d *Daemon) handleConnection(conn net.Conn) {
 	defer conn.Close()
-	
+
 	decoder := json.NewDecoder(conn)
 	encoder := json.NewEncoder(conn)
-	
+
 	var req SignRequest
 	if err := decoder.Decode(&req); err != nil {
 		response := SignResponse{
@@ -275,12 +320,14 @@ func (d *Daemon) handleConnection(conn net.Conn) {
 		encoder.Encode(response)
 		return
 	}
-	
+
 	// Handle requests
 	switch req.Method {
 	case "sign_event":
+		d.mu.RLock()
 		signature, err := d.signEvent(req.EventJSON)
-		
+		d.mu.RUnlock()
+
 		var response SignResponse
 		if err != nil {
 			response = SignResponse{
@@ -294,12 +341,16 @@ func (d *Daemon) handleConnection(conn net.Conn) {
 			}
 		}
 		encoder.Encode(response)
-		
+
 	case "get_npub":
 		// Return current user's npub
+		d.mu.RLock()
+		npub := d.npub
+		d.mu.RUnlock()
+
 		response := SignResponse{
 			ID:        req.ID,
-			Signature: d.npub, // Using Signature field for npub response
+			Signature: npub, // Using Signature field for npub response
 		}
 		encoder.Encode(response)
 
@@ -369,7 +420,10 @@ func (d *Daemon) handleConnection(conn net.Conn) {
 			return
 		}
 
+		d.mu.RLock()
 		encrypted, err := nip44Encrypt(req.Plaintext, req.RecipientPubkey, d.privateKey)
+		d.mu.RUnlock()
+
 		var response SignResponse
 		if err != nil {
 			response = SignResponse{
@@ -395,7 +449,10 @@ func (d *Daemon) handleConnection(conn net.Conn) {
 			return
 		}
 
+		d.mu.RLock()
 		plaintext, err := nip44Decrypt(req.Payload, req.SenderPubkey, d.privateKey)
+		d.mu.RUnlock()
+
 		var response SignResponse
 		if err != nil {
 			response = SignResponse{
@@ -421,7 +478,10 @@ func (d *Daemon) handleConnection(conn net.Conn) {
 			return
 		}
 
+		d.mu.RLock()
 		encrypted, err := nip04Encrypt(req.Plaintext, req.RecipientPubkey, d.privateKey)
+		d.mu.RUnlock()
+
 		var response SignResponse
 		if err != nil {
 			response = SignResponse{
@@ -447,7 +507,10 @@ func (d *Daemon) handleConnection(conn net.Conn) {
 			return
 		}
 
+		d.mu.RLock()
 		plaintext, err := nip04Decrypt(req.Payload, req.SenderPubkey, d.privateKey)
+		d.mu.RUnlock()
+
 		var response SignResponse
 		if err != nil {
 			response = SignResponse{
@@ -477,6 +540,328 @@ func (d *Daemon) handleConnection(conn net.Conn) {
 			os.Exit(0)
 		}()
 
+	// ========== Multi-Account API Endpoints ==========
+
+	case "list_accounts":
+		accounts, err := listAccounts()
+		if err != nil {
+			response := ListAccountsResponse{
+				ID:    req.ID,
+				Error: err.Error(),
+			}
+			encoder.Encode(response)
+			return
+		}
+
+		activeNpub, _ := loadActiveAccount()
+		activePubkey := ""
+		if activeNpub != "" {
+			activePubkey, _ = npubToPubkey(activeNpub)
+		}
+
+		var accountResponses []AccountResponse
+		for _, acc := range accounts {
+			accountResponses = append(accountResponses, AccountResponse{
+				Pubkey:    acc.Pubkey,
+				Npub:      acc.Npub,
+				CreatedAt: acc.CreatedAt.Unix(),
+			})
+		}
+
+		response := ListAccountsResponse{
+			ID:           req.ID,
+			Accounts:     accountResponses,
+			ActivePubkey: activePubkey,
+		}
+		encoder.Encode(response)
+
+	case "add_account":
+		if req.Nsec == "" || req.Password == "" {
+			response := AccountActionResponse{
+				ID:    req.ID,
+				Error: "nsec and password required",
+			}
+			encoder.Encode(response)
+			return
+		}
+
+		// Validate nsec and get npub
+		privateKey, err := nsecToPrivateKey(req.Nsec)
+		if err != nil {
+			response := AccountActionResponse{
+				ID:    req.ID,
+				Error: fmt.Sprintf("invalid nsec: %v", err),
+			}
+			encoder.Encode(response)
+			return
+		}
+		npub := privateKeyToNpub(privateKey)
+
+		// Check if account already exists
+		if accountExists(npub) {
+			response := AccountActionResponse{
+				ID:    req.ID,
+				Error: "account already exists",
+			}
+			encoder.Encode(response)
+			return
+		}
+
+		// Encrypt nsec
+		encryptedKey, err := encryptNsec(req.Nsec, req.Password)
+		if err != nil {
+			response := AccountActionResponse{
+				ID:    req.ID,
+				Error: fmt.Sprintf("encryption failed: %v", err),
+			}
+			encoder.Encode(response)
+			return
+		}
+
+		// Save account
+		if err := saveAccountEncryptedKey(npub, encryptedKey); err != nil {
+			response := AccountActionResponse{
+				ID:    req.ID,
+				Error: fmt.Sprintf("failed to save account: %v", err),
+			}
+			encoder.Encode(response)
+			return
+		}
+
+		// Set as active if requested
+		if req.SetActive {
+			saveActiveAccount(npub)
+		}
+
+		pubkey, _ := npubToPubkey(npub)
+		response := AccountActionResponse{
+			ID:      req.ID,
+			Success: true,
+			Pubkey:  pubkey,
+			Npub:    npub,
+		}
+		encoder.Encode(response)
+
+	case "switch_account":
+		// Accept either pubkey or npub
+		targetNpub := req.Npub
+		if targetNpub == "" && req.Pubkey != "" {
+			// Find npub by pubkey
+			accounts, _ := listAccounts()
+			for _, acc := range accounts {
+				if acc.Pubkey == req.Pubkey {
+					targetNpub = acc.Npub
+					break
+				}
+			}
+		}
+
+		if targetNpub == "" {
+			response := AccountActionResponse{
+				ID:    req.ID,
+				Error: "pubkey or npub required",
+			}
+			encoder.Encode(response)
+			return
+		}
+
+		if req.Password == "" {
+			response := AccountActionResponse{
+				ID:    req.ID,
+				Error: "password required",
+			}
+			encoder.Encode(response)
+			return
+		}
+
+		// Check if account exists
+		if !accountExists(targetNpub) {
+			response := AccountActionResponse{
+				ID:    req.ID,
+				Error: "account not found",
+			}
+			encoder.Encode(response)
+			return
+		}
+
+		// Load and verify password
+		encKey, err := loadAccountEncryptedKey(targetNpub)
+		if err != nil {
+			response := AccountActionResponse{
+				ID:    req.ID,
+				Error: fmt.Sprintf("failed to load account: %v", err),
+			}
+			encoder.Encode(response)
+			return
+		}
+
+		nsec, err := decryptNsec(encKey, req.Password)
+		if err != nil {
+			response := AccountActionResponse{
+				ID:    req.ID,
+				Error: "invalid password",
+			}
+			encoder.Encode(response)
+			return
+		}
+
+		// Convert to private key
+		newPrivateKey, err := nsecToPrivateKey(nsec)
+		if err != nil {
+			response := AccountActionResponse{
+				ID:    req.ID,
+				Error: "corrupted key file",
+			}
+			encoder.Encode(response)
+			return
+		}
+
+		newPubkey, _ := npubToPubkey(targetNpub)
+
+		// Create trust session for new account
+		session, err := createTrustSession(nsec)
+		if err == nil {
+			saveAccountTrustSession(targetNpub, session)
+		}
+
+		// Clear nsec from memory
+		for i := range nsec {
+			nsec = nsec[:i] + "x" + nsec[i+1:]
+		}
+
+		// Update daemon state
+		d.mu.Lock()
+		// Clear old private key from memory
+		if d.privateKey != nil {
+			keyBytes := d.privateKey.Serialize()
+			for i := range keyBytes {
+				keyBytes[i] = 0
+			}
+		}
+		d.privateKey = newPrivateKey
+		d.npub = targetNpub
+		d.pubkey = newPubkey
+		d.mu.Unlock()
+
+		// Update active account file
+		saveActiveAccount(targetNpub)
+
+		response := AccountActionResponse{
+			ID:      req.ID,
+			Success: true,
+			Pubkey:  newPubkey,
+			Npub:    targetNpub,
+		}
+		encoder.Encode(response)
+
+	case "remove_account":
+		// Accept either pubkey or npub
+		targetNpub := req.Npub
+		if targetNpub == "" && req.Pubkey != "" {
+			// Find npub by pubkey
+			accounts, _ := listAccounts()
+			for _, acc := range accounts {
+				if acc.Pubkey == req.Pubkey {
+					targetNpub = acc.Npub
+					break
+				}
+			}
+		}
+
+		if targetNpub == "" {
+			response := AccountActionResponse{
+				ID:    req.ID,
+				Error: "pubkey or npub required",
+			}
+			encoder.Encode(response)
+			return
+		}
+
+		if req.Password == "" {
+			response := AccountActionResponse{
+				ID:    req.ID,
+				Error: "password required",
+			}
+			encoder.Encode(response)
+			return
+		}
+
+		// Check if account exists
+		if !accountExists(targetNpub) {
+			response := AccountActionResponse{
+				ID:    req.ID,
+				Error: "account not found",
+			}
+			encoder.Encode(response)
+			return
+		}
+
+		// Verify password
+		encKey, err := loadAccountEncryptedKey(targetNpub)
+		if err != nil {
+			response := AccountActionResponse{
+				ID:    req.ID,
+				Error: fmt.Sprintf("failed to load account: %v", err),
+			}
+			encoder.Encode(response)
+			return
+		}
+
+		_, err = decryptNsec(encKey, req.Password)
+		if err != nil {
+			response := AccountActionResponse{
+				ID:    req.ID,
+				Error: "invalid password",
+			}
+			encoder.Encode(response)
+			return
+		}
+
+		// Check if this is the current active account
+		d.mu.RLock()
+		isCurrentAccount := d.npub == targetNpub
+		d.mu.RUnlock()
+
+		if isCurrentAccount {
+			response := AccountActionResponse{
+				ID:    req.ID,
+				Error: "cannot remove active account - switch to another account first",
+			}
+			encoder.Encode(response)
+			return
+		}
+
+		// Remove account
+		if err := removeAccount(targetNpub); err != nil {
+			response := AccountActionResponse{
+				ID:    req.ID,
+				Error: fmt.Sprintf("failed to remove account: %v", err),
+			}
+			encoder.Encode(response)
+			return
+		}
+
+		response := AccountActionResponse{
+			ID:      req.ID,
+			Success: true,
+		}
+		encoder.Encode(response)
+
+	case "get_active_account":
+		d.mu.RLock()
+		npub := d.npub
+		pubkey := d.pubkey
+		isUnlocked := d.privateKey != nil
+		d.mu.RUnlock()
+
+		response := ActiveAccountResponse{
+			ID:         req.ID,
+			Pubkey:     pubkey,
+			Npub:       npub,
+			IsUnlocked: isUnlocked,
+		}
+		encoder.Encode(response)
+
 	default:
 		response := SignResponse{
 			ID:    req.ID,
@@ -505,17 +890,16 @@ func (d *Daemon) shutdownDaemon() {
 	case d.shutdown <- true:
 	default:
 	}
-	
+
 	if d.listener != nil {
 		d.listener.Close()
 	}
-	
-	// Remove socket file
-	if socketPath, err := getSocketPath(); err == nil {
-		os.Remove(socketPath)
-	}
-	
+
+	// Platform-specific cleanup (removes Unix socket file, no-op on Windows)
+	cleanupListener()
+
 	// Clear private key from memory (security)
+	d.mu.Lock()
 	if d.privateKey != nil {
 		// Zero out private key bytes
 		keyBytes := d.privateKey.Serialize()
@@ -523,6 +907,7 @@ func (d *Daemon) shutdownDaemon() {
 			keyBytes[i] = 0
 		}
 	}
-	
+	d.mu.Unlock()
+
 	fmt.Println("Daemon shutdown complete")
 }
