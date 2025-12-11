@@ -1,6 +1,10 @@
 # NoorSigner - Secure Key Signer for Nostr
 
+**Cross-platform key signer for Linux, macOS, and Windows.**
+
 NoorSigner keeps your Nostr private keys safe. It runs in the background and signs messages for your Nostr apps - your keys never leave your computer.
+
+Works standalone with any Nostr client that supports external signers. Battle-tested with [NoorNote](https://github.com/77elements/noornote).
 
 ---
 
