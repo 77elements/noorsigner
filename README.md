@@ -1,6 +1,6 @@
 # NoorSigner - Secure Key Signer for Nostr
 
-**Cross-platform key signer for Linux, macOS, and Windows.**
+**Key signer for macOS and Linux.**
 
 NoorSigner keeps your Nostr private keys safe. It runs in the background and signs messages for your Nostr apps - your keys never leave your computer.
 
@@ -128,7 +128,6 @@ The daemon stays running in the background. Your Nostr app handles the rest.
 - 🛡️ **Trust Mode**: 24-hour authentication caching per account
 - 🔑 **NIP-44 & NIP-04**: Encryption/decryption for DMs
 - 🔌 **Unix Socket IPC**: Fast, secure local communication
-- 🖥️ **Cross-Platform**: macOS, Linux, Windows support
 - 🔒 **Memory Safety**: Keys cleared from memory after use
 - 🔄 **Background Daemon**: Fork-based process isolation
 - 🚀 **Live Account Switching**: Switch accounts without restarting daemon
@@ -253,9 +252,7 @@ When upgrading from an older single-account NoorSigner:
 
 **Transport**: Unix Domain Socket (JSON newline-delimited)
 
-**Socket Paths**:
-- **macOS/Linux**: `~/.noorsigner/noorsigner.sock`
-- **Windows**: `\\.\pipe\noorsigner` (Named Pipe)
+**Socket Path**: `~/.noorsigner/noorsigner.sock`
 
 **Request Format**:
 ```json
@@ -786,34 +783,6 @@ The Unix socket is created with `0600` permissions (owner read/write only), prev
 - Socket path: `~/.noorsigner/noorsigner.sock`
 - Autostart: XDG Autostart (`~/.config/autostart/noorsigner.desktop`)
 - Same daemon behavior as macOS
-
-### Windows
-- Named Pipe: `\\.\pipe\noorsigner`
-- Storage: `%APPDATA%\NoorSigner\`
-- Daemon runs in background with `DETACHED_PROCESS` flag
-- Autostart: Not yet implemented
-
-#### Windows Named Pipe Example
-
-```powershell
-# PowerShell example to connect to NoorSigner
-$pipe = New-Object System.IO.Pipes.NamedPipeClientStream(".", "noorsigner", [System.IO.Pipes.PipeDirection]::InOut)
-$pipe.Connect(5000)
-
-$writer = New-Object System.IO.StreamWriter($pipe)
-$reader = New-Object System.IO.StreamReader($pipe)
-
-# Send request
-$request = '{"id":"req-1","method":"get_npub"}'
-$writer.WriteLine($request)
-$writer.Flush()
-
-# Read response
-$response = $reader.ReadLine()
-Write-Host $response
-
-$pipe.Close()
-```
 
 ---
 

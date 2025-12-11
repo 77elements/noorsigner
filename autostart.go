@@ -14,8 +14,6 @@ func getAutostartStatus() (bool, error) {
 		return getAutostartStatusMac()
 	case "linux":
 		return getAutostartStatusLinux()
-	case "windows":
-		return getAutostartStatusWindows()
 	default:
 		return false, fmt.Errorf("unsupported platform: %s", runtime.GOOS)
 	}
@@ -28,8 +26,6 @@ func enableAutostart() error {
 		return enableAutostartMac()
 	case "linux":
 		return enableAutostartLinux()
-	case "windows":
-		return enableAutostartWindows()
 	default:
 		return fmt.Errorf("unsupported platform: %s", runtime.GOOS)
 	}
@@ -42,8 +38,6 @@ func disableAutostart() error {
 		return disableAutostartMac()
 	case "linux":
 		return disableAutostartLinux()
-	case "windows":
-		return disableAutostartWindows()
 	default:
 		return fmt.Errorf("unsupported platform: %s", runtime.GOOS)
 	}
@@ -125,14 +119,13 @@ func disableAutostartMac() error {
 	return err
 }
 
-// Linux: systemd user service or XDG autostart
+// Linux: XDG autostart
 func getAutostartStatusLinux() (bool, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return false, err
 	}
 
-	// Check XDG autostart (most compatible)
 	desktopPath := filepath.Join(home, ".config", "autostart", "noorsigner.desktop")
 	_, err = os.Stat(desktopPath)
 	if os.IsNotExist(err) {
@@ -188,20 +181,4 @@ func disableAutostartLinux() error {
 		return nil
 	}
 	return err
-}
-
-// Windows: Registry Run key
-func getAutostartStatusWindows() (bool, error) {
-	// TODO: Implement Windows registry check
-	return false, fmt.Errorf("Windows autostart not yet implemented")
-}
-
-func enableAutostartWindows() error {
-	// TODO: Implement Windows registry modification
-	return fmt.Errorf("Windows autostart not yet implemented")
-}
-
-func disableAutostartWindows() error {
-	// TODO: Implement Windows registry modification
-	return fmt.Errorf("Windows autostart not yet implemented")
 }

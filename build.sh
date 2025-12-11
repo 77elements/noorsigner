@@ -24,9 +24,5 @@ GOOS=linux GOARCH=amd64 go build -o "$OUT_DIR/noorsigner-linux-amd64" -ldflags="
 echo "Building Linux ARM64..."
 GOOS=linux GOARCH=arm64 go build -o "$OUT_DIR/noorsigner-linux-arm64" -ldflags="-s -w" .
 
-# Windows (AMD64)
-echo "Building Windows AMD64..."
-GOOS=windows GOARCH=amd64 go build -o "$OUT_DIR/noorsigner-windows-amd64.exe" -ldflags="-s -w" .
-
 echo "Build complete! Binaries in $OUT_DIR"
 ls -lh "$OUT_DIR"
